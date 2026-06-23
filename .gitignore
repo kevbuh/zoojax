@@ -11,4 +11,4 @@ __pycache__
 .pytest_cache
 .DS_Store
 *.pyc
-rlkit_ref
+misc
