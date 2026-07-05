@@ -40,9 +40,7 @@ class ReplayBufferSamples(NamedTuple):
     dones: torch.Tensor
     rewards: torch.Tensor
 
-def get_obs_shape(
-    observation_space: spaces.Space,
-) -> tuple[int, ...] | dict[str, tuple[int, ...]]:
+def get_obs_shape(observation_space: spaces.Space) -> tuple[int, ...] | dict[str, tuple[int, ...]]:
     """
     Get the shape of the observation (useful for the buffers).
 
@@ -62,7 +60,6 @@ def get_obs_shape(
         return observation_space.shape
     elif isinstance(observation_space, spaces.Dict):
         return {key: get_obs_shape(subspace) for (key, subspace) in observation_space.spaces.items()}  # type: ignore[misc]
-
     else:
         raise NotImplementedError(f"{observation_space} observation space is not supported")
 
@@ -105,11 +102,9 @@ def get_device(device: torch.device | str = "auto") -> torch.device:
         device = "cuda"
     # Force conversion to torch.device
     device = torch.device(device)
-
     # Cuda not available
     if device.type == torch.device("cuda").type and not torch.cuda.is_available():
         return torch.device("cpu")
-
     return device
 
 class BaseBuffer(ABC):
@@ -123,30 +118,21 @@ class BaseBuffer(ABC):
         to which the values will be converted
     :param n_envs: Number of parallel environments
     """
-
     observation_space: spaces.Space
     obs_shape: tuple[int, ...]
-
     def __init__(
-        self,
-        buffer_size: int,
-        observation_space: spaces.Space,
-        action_space: spaces.Space,
-        device: torch.device | str = "auto",
-        n_envs: int = 1,
+        self, buffer_size: int, observation_space: spaces.Space, action_space: spaces.Space, device: torch.device | str = "auto", n_envs: int = 1
     ):
         super().__init__()
         self.buffer_size = buffer_size
         self.observation_space = observation_space
         self.action_space = action_space
         self.obs_shape = get_obs_shape(observation_space)  # type: ignore[assignment]
-
         self.action_dim = get_action_dim(action_space)
         self.pos = 0
         self.full = False
         self.device = get_device(device)
         self.n_envs = n_envs
-
     @staticmethod
     def swap_and_flatten(arr: np.ndarray) -> np.ndarray:
         """
@@ -161,7 +147,6 @@ class BaseBuffer(ABC):
         if len(shape) < 3:
             shape = (*shape, 1)
         return arr.swapaxes(0, 1).reshape(shape[0] * shape[1], *shape[2:])
-
     def size(self) -> int:
         """
         :return: The current size of the buffer
@@ -169,13 +154,11 @@ class BaseBuffer(ABC):
         if self.full:
             return self.buffer_size
         return self.pos
-
     def add(self, *args, **kwargs) -> None:
         """
         Add elements to the buffer.
         """
         raise NotImplementedError()
-
     def extend(self, *args, **kwargs) -> None:
         """
         Add a new batch of transitions to the buffer
@@ -183,14 +166,12 @@ class BaseBuffer(ABC):
         # Do a for loop along the batch axis
         for data in zip(*args):
             self.add(*data)
-
     def reset(self) -> None:
         """
         Reset the buffer.
         """
         self.pos = 0
         self.full = False
-
     def sample(self, batch_size: int):
         """
         :param batch_size: Number of element to sample
@@ -199,7 +180,6 @@ class BaseBuffer(ABC):
         upper_bound = self.buffer_size if self.full else self.pos
         batch_inds = np.random.randint(0, upper_bound, size=batch_size)
         return self._get_samples(batch_inds)
-
     @abstractmethod
     def _get_samples(self, batch_inds: np.ndarray) -> ReplayBufferSamples | RolloutBufferSamples:
         """
@@ -207,7 +187,6 @@ class BaseBuffer(ABC):
         :return:
         """
         raise NotImplementedError()
-
     def to_torch(self, array: np.ndarray, copy: bool = True) -> torch.Tensor:
         """
         Convert a numpy array to a PyTorch tensor.
@@ -241,14 +220,12 @@ class ReplayBuffer(BaseBuffer):
         separately and treat the task as infinite horizon task.
         https://github.com/DLR-RM/stable-baselines3/issues/284
     """
-
     observations: np.ndarray
     next_observations: np.ndarray
     actions: np.ndarray
     rewards: np.ndarray
     dones: np.ndarray
     timeouts: np.ndarray
-
     def __init__(
         self,
         buffer_size: int,
@@ -260,48 +237,31 @@ class ReplayBuffer(BaseBuffer):
         handle_timeout_termination: bool = True,
     ):
         super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
-
         # Adjust buffer size
         self.buffer_size = max(buffer_size // n_envs, 1)
-
         # Check that the replay buffer can fit into the memory
         if psutil is not None:
             mem_available = psutil.virtual_memory().available
-
         # there is a bug if both optimize_memory_usage and handle_timeout_termination are true
         # see https://github.com/DLR-RM/stable-baselines3/issues/934
         if optimize_memory_usage and handle_timeout_termination:
-            raise ValueError(
-                "ReplayBuffer does not support optimize_memory_usage = True "
-                "and handle_timeout_termination = True simultaneously."
-            )
+            raise ValueError("ReplayBuffer does not support optimize_memory_usage = True " "and handle_timeout_termination = True simultaneously.")
         self.optimize_memory_usage = optimize_memory_usage
-
         self.observations = np.zeros((self.buffer_size, self.n_envs, *self.obs_shape), dtype=observation_space.dtype)
-
         if not optimize_memory_usage:
             # When optimizing memory, `observations` contains also the next observation
             self.next_observations = np.zeros((self.buffer_size, self.n_envs, *self.obs_shape), dtype=observation_space.dtype)
-
-        self.actions = np.zeros(
-            (self.buffer_size, self.n_envs, self.action_dim), dtype=self._maybe_cast_dtype(action_space.dtype)
-        )
-
+        self.actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=self._maybe_cast_dtype(action_space.dtype))
         self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         # Handle timeouts termination properly if needed
         # see https://github.com/DLR-RM/stable-baselines3/issues/284
         self.handle_timeout_termination = handle_timeout_termination
         self.timeouts = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
-
         if psutil is not None:
-            total_memory_usage: float = (
-                self.observations.nbytes + self.actions.nbytes + self.rewards.nbytes + self.dones.nbytes
-            )
-
+            total_memory_usage: float = self.observations.nbytes + self.actions.nbytes + self.rewards.nbytes + self.dones.nbytes
             if not optimize_memory_usage:
                 total_memory_usage += self.next_observations.nbytes
-
             if total_memory_usage > mem_available:
                 # Convert to GB
                 total_memory_usage /= 1e9
@@ -310,45 +270,31 @@ class ReplayBuffer(BaseBuffer):
                     "This system does not have apparently enough memory to store the complete "
                     f"replay buffer {total_memory_usage:.2f}GB > {mem_available:.2f}GB"
                 )
-
     def add(
-        self,
-        obs: np.ndarray,
-        next_obs: np.ndarray,
-        action: np.ndarray,
-        reward: np.ndarray,
-        done: np.ndarray,
-        infos: list[dict[str, Any]],
+        self, obs: np.ndarray, next_obs: np.ndarray, action: np.ndarray, reward: np.ndarray, done: np.ndarray, infos: list[dict[str, Any]]
     ) -> None:
         # Reshape needed when using multiple envs with discrete observations
         # as numpy cannot broadcast (n_discrete,) to (n_discrete, 1)
         if isinstance(self.observation_space, spaces.Discrete):
             obs = obs.reshape((self.n_envs, *self.obs_shape))
             next_obs = next_obs.reshape((self.n_envs, *self.obs_shape))
-
         # Reshape to handle multi-dim and discrete action spaces, see GH #970 #1392
         action = action.reshape((self.n_envs, self.action_dim))
-
         # Copy to avoid modification by reference
         self.observations[self.pos] = np.array(obs)
-
         if self.optimize_memory_usage:
             self.observations[(self.pos + 1) % self.buffer_size] = np.array(next_obs)
         else:
             self.next_observations[self.pos] = np.array(next_obs)
-
         self.actions[self.pos] = np.array(action)
         self.rewards[self.pos] = np.array(reward)
         self.dones[self.pos] = np.array(done)
-
         if self.handle_timeout_termination:
             self.timeouts[self.pos] = np.array([info.get("TimeLimit.truncated", False) for info in infos])
-
         self.pos += 1
         if self.pos == self.buffer_size:
             self.full = True
             self.pos = 0
-
     def sample(self, batch_size: int) -> ReplayBufferSamples:
         """
         Sample elements from the replay buffer.
@@ -368,16 +314,13 @@ class ReplayBuffer(BaseBuffer):
         else:
             batch_inds = np.random.randint(0, self.pos, size=batch_size)
         return self._get_samples(batch_inds)
-
     def _get_samples(self, batch_inds: np.ndarray) -> ReplayBufferSamples:
         # Sample randomly the env idx
         env_indices = np.random.randint(0, high=self.n_envs, size=(len(batch_inds),))
-
         if self.optimize_memory_usage:
             next_obs = self.observations[(batch_inds + 1) % self.buffer_size, env_indices, :]
         else:
             next_obs = self.next_observations[batch_inds, env_indices, :]
-
         data = (
             self.observations[batch_inds, env_indices, :],
             self.actions[batch_inds, env_indices, :],
@@ -388,7 +331,6 @@ class ReplayBuffer(BaseBuffer):
             self.rewards[batch_inds, env_indices].reshape(-1, 1),
         )
         return ReplayBufferSamples(*tuple(map(self.to_torch, data)))
-
     @staticmethod
     def _maybe_cast_dtype(dtype: np.typing.DTypeLike) -> np.typing.DTypeLike:
         """
@@ -428,7 +370,6 @@ class Args:
     """whether to upload the saved model to huggingface"""
     hf_entity: str = ""
     """the user or org name of the model repository from the Hugging Face Hub"""
-
     # Algorithm specific arguments
     env_id: str = "BreakoutNoFrameskip-v4"
     """the id of the environment"""
@@ -467,14 +408,12 @@ class NoopResetEnv(gym.Wrapper[np.ndarray, int, np.ndarray, int]):
     :param env: Environment to wrap
     :param noop_max: Maximum value of no-ops to run
     """
-
     def __init__(self, env: gym.Env, noop_max: int = 30) -> None:
         super().__init__(env)
         self.noop_max = noop_max
         self.override_num_noops = None
         self.noop_action = 0
         assert env.unwrapped.get_action_meanings()[0] == "NOOP"  # type: ignore[attr-defined]
-
     def reset(self, **kwargs):
         self.env.reset(**kwargs)
         if self.override_num_noops is not None:
@@ -489,17 +428,15 @@ class NoopResetEnv(gym.Wrapper[np.ndarray, int, np.ndarray, int]):
             if terminated or truncated:
                 obs, info = self.env.reset(**kwargs)
         return obs, info
-    
+
 class ClipRewardEnv(gym.RewardWrapper):
     """
     Clip the reward to {+1, 0, -1} by its sign.
 
     :param env: Environment to wrap
     """
-
     def __init__(self, env: gym.Env) -> None:
         super().__init__(env)
-
     def reward(self, reward: SupportsFloat) -> float:
         """
         Bin reward to {+1, 0, -1} by its sign.
@@ -508,19 +445,17 @@ class ClipRewardEnv(gym.RewardWrapper):
         :return:
         """
         return np.sign(float(reward))
-    
+
 class FireResetEnv(gym.Wrapper[np.ndarray, int, np.ndarray, int]):
     """
     Take action on reset for environments that are fixed until firing.
 
     :param env: Environment to wrap
     """
-
     def __init__(self, env: gym.Env) -> None:
         super().__init__(env)
         assert env.unwrapped.get_action_meanings()[1] == "FIRE"  # type: ignore[attr-defined]
         assert len(env.unwrapped.get_action_meanings()) >= 3  # type: ignore[attr-defined]
-
     def reset(self, **kwargs):
         self.env.reset(**kwargs)
         obs, _, terminated, truncated, _ = self.env.step(1)
@@ -531,7 +466,6 @@ class FireResetEnv(gym.Wrapper[np.ndarray, int, np.ndarray, int]):
             self.env.reset(**kwargs)
         return obs, {}
 
-
 class EpisodicLifeEnv(gym.Wrapper[np.ndarray, int, np.ndarray, int]):
     """
     Make end-of-life == end-of-episode, but only reset on true game over.
@@ -539,12 +473,10 @@ class EpisodicLifeEnv(gym.Wrapper[np.ndarray, int, np.ndarray, int]):
 
     :param env: Environment to wrap
     """
-
     def __init__(self, env: gym.Env) -> None:
         super().__init__(env)
         self.lives = 0
         self.was_real_done = True
-
     def step(self, action: int):
         obs, reward, terminated, truncated, info = self.env.step(action)
         self.was_real_done = terminated or truncated
@@ -558,7 +490,6 @@ class EpisodicLifeEnv(gym.Wrapper[np.ndarray, int, np.ndarray, int]):
             terminated = True
         self.lives = lives
         return obs, reward, terminated, truncated, info
-
     def reset(self, **kwargs):
         """
         Calls the Gym environment reset, only when lives are exhausted.
@@ -573,7 +504,6 @@ class EpisodicLifeEnv(gym.Wrapper[np.ndarray, int, np.ndarray, int]):
         else:
             # no-op step to advance from terminal/lost life state
             obs, _, terminated, truncated, info = self.env.step(0)
-
             # The no-op step can lead to a game over, so we need to check it again
             # to see if we should reset the environment and avoid the
             # monitor.py `RuntimeError: Tried to step environment that needs reset`
@@ -591,7 +521,6 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         else:
             env = gym.make(env_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
-
         env = NoopResetEnv(env, noop_max=30)
         env = gym.wrappers.MaxAndSkipObservation(env, skip=4)
         env = EpisodicLifeEnv(env)
@@ -601,10 +530,8 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         env = gym.wrappers.ResizeObservation(env, (84, 84))
         env = gym.wrappers.GrayscaleObservation(env)
         env = gym.wrappers.FrameStackObservation(env, 4)
-
         env.action_space.seed(seed)
         return env
-
     return thunk
 
 # ALGO LOGIC: initialize agent here:
@@ -623,7 +550,6 @@ class QNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(512, env.single_action_space.n),
         )
-
     def forward(self, x):
         return self.network(x / 255.0)
 
@@ -637,29 +563,30 @@ if __name__ == "__main__":
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
-        wandb.init(project=args.wandb_project_name, entity=args.wandb_entity, sync_tensorboard=True, config=vars(args), name=run_name, monitor_gym=True, save_code=True)
+        wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            sync_tensorboard=True,
+            config=vars(args),
+            name=run_name,
+            monitor_gym=True,
+            save_code=True,
+        )
     writer = SummaryWriter(f"runs/{run_name}")
-    writer.add_text("hyperparameters","|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])))
-
+    writer.add_text("hyperparameters", "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])))
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
-
     device = torch.device("mps" if torch.mps.is_available() else "cpu")
-
     # env setup
-    envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
-    )
+    envs = gym.vector.SyncVectorEnv([make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)])
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
-
     q_network = QNetwork(envs).to(device)
     optimizer = optim.Adam(q_network.parameters(), lr=args.learning_rate)
     target_network = QNetwork(envs).to(device)
     target_network.load_state_dict(q_network.state_dict())
-
     rb = ReplayBuffer(
         args.buffer_size,
         envs.single_observation_space,
@@ -669,7 +596,6 @@ if __name__ == "__main__":
         handle_timeout_termination=False,
     )
     start_time = time.time()
-
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
     for global_step in range(args.total_timesteps):
@@ -680,10 +606,8 @@ if __name__ == "__main__":
         else:
             q_values = q_network(torch.Tensor(obs).to(device))
             actions = torch.argmax(q_values, dim=1).cpu().numpy()
-
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
-
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "episode" in infos:
             done_mask = infos.get("_episode", None)
@@ -697,17 +621,14 @@ if __name__ == "__main__":
                         # print(f"global_step={global_step}, episodic_return={ep_r}")
                         writer.add_scalar("train/episode_return", ep_r, global_step)
                         writer.add_scalar("train/episode_length", ep_l, global_step)
-
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):
             if trunc:
                 real_next_obs[idx] = infos["final_observation"][idx]
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
-
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
-
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
             if global_step % args.train_frequency == 0:
@@ -717,47 +638,33 @@ if __name__ == "__main__":
                     td_target = data.rewards.flatten() + args.gamma * target_max * (1 - data.dones.flatten())
                 old_val = q_network(data.observations).gather(1, data.actions).squeeze()
                 loss = F.mse_loss(td_target, old_val)
-
                 if global_step % 100 == 0:
                     writer.add_scalar("losses/td_loss", loss, global_step)
                     writer.add_scalar("losses/q_values", old_val.mean().item(), global_step)
                     print("SPS:", int(global_step / (time.time() - start_time)))
                     writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-
                 # optimize the model
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-
             # update target network
             if global_step % args.target_network_frequency == 0:
                 for target_network_param, q_network_param in zip(target_network.parameters(), q_network.parameters()):
                     target_network_param.data.copy_(args.tau * q_network_param.data + (1.0 - args.tau) * target_network_param.data)
-
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
         torch.save(q_network.state_dict(), model_path)
         print(f"model saved to {model_path}")
         from cleanrl_utils.evals.dqn_eval import evaluate
-
         episodic_returns = evaluate(
-            model_path,
-            make_env,
-            args.env_id,
-            eval_episodes=10,
-            run_name=f"{run_name}-eval",
-            Model=QNetwork,
-            device=device,
-            epsilon=args.end_e,
+            model_path, make_env, args.env_id, eval_episodes=10, run_name=f"{run_name}-eval", Model=QNetwork, device=device, epsilon=args.end_e
         )
         for idx, episodic_return in enumerate(episodic_returns):
             writer.add_scalar("eval/episodic_return", episodic_return, idx)
-
         if args.upload_model:
             from cleanrl_utils.huggingface import push_to_hub
             repo_name = f"{args.env_id}-{args.exp_name}-seed{args.seed}"
             repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
             push_to_hub(args, episodic_returns, repo_id, "DQN", f"runs/{run_name}", f"videos/{run_name}-eval")
-
     envs.close()
     writer.close()
