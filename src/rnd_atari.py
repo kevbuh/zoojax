@@ -1,5 +1,23 @@
 # Paper:          https://arxiv.org/abs/1810.12894
 # Reference impl: https://github.com/openai/random-network-distillation
+# Wandb report:   https://wandb.ai/kevinbuhler/rnd-atari-jax/reports/ZOOJAX-Atari-RND--VmlldzoxNzQzOTYzOA
+# Run with:  uv run src/rnd_atari.py
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "jax[cuda12]",
+#     "flax",
+#     "optax",
+#     "distrax",
+#     "numpy",
+#     "gymnasium[atari]",
+#     "ale-py",
+#     "envpool",
+#     "opencv-python",
+#     "tyro",
+#     "wandb",
+# ]
+# ///
 
 from dataclasses import dataclass
 from typing import Any, NamedTuple
@@ -67,15 +85,9 @@ class RNDTargetCNN(nn.Module):
     rep_size: int = 512
     @nn.compact
     def __call__(self, x):
-        x = _lrelu(
-            nn.Conv(self.convfeat, (8, 8), (4, 4), padding="VALID", kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0), name="c1r")(x)
-        )
-        x = _lrelu(
-            nn.Conv(self.convfeat * 2, (4, 4), (2, 2), padding="VALID", kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0), name="c2r")(x)
-        )
-        x = _lrelu(
-            nn.Conv(self.convfeat * 2, (3, 3), (1, 1), padding="VALID", kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0), name="c3r")(x)
-        )
+        x = _lrelu(nn.Conv(self.convfeat, (8, 8), (4, 4), padding="VALID", kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0), name="c1r")(x))
+        x = _lrelu(nn.Conv(self.convfeat * 2, (4, 4), (2, 2), padding="VALID", kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0), name="c2r")(x))
+        x = _lrelu(nn.Conv(self.convfeat * 2, (3, 3), (1, 1), padding="VALID", kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0), name="c3r")(x))
         x = x.reshape(x.shape[0], -1)
         x = nn.Dense(self.rep_size, kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0), name="fc1r")(x)
         return x
@@ -305,7 +317,7 @@ def create_learner(config, rng, obs_shape, num_actions, num_total_updates=None):
 class Config:
     # ppo (paper defaults)
     lr: float = 1e-4
-    num_envs: int = 32
+    num_envs: int = 128
     num_steps: int = 128
     update_epochs: int = 4
     num_minibatches: int = 4
@@ -331,6 +343,11 @@ class Config:
     anneal_lr: bool = False
     normalize_adv: bool = False  # paper does NOT normalize advantages
     # training
+    # envpool's XLA step feeds a fully-jitted on-device rollout+learner (see
+    # run_xla). ~11k SPS at num_envs=128 on a 6-core / RTX 5080, paper-faithful.
+    # (Single-GPU caps RND at ~11-12k: envpool's XLA step blocks the one CUDA
+    #  stream, so the learner can't overlap env stepping. ~20k would need a 2nd GPU.)
+    envpool_num_threads: int = 0  # 0 -> envpool auto (defaults to num_envs)
     seed: int = 0
     env: str = "MontezumaRevengeNoFrameskip-v4"
     total_timesteps: int = int(1e9)
@@ -342,309 +359,193 @@ class Config:
     log_every_n_updates: int = 1
 
 if __name__ == "__main__":
-    """Original env composition (atari_wrappers.py:200-224):
-        gym.make('MontezumaRevengeNoFrameskip-v4')
-          -> StickyActionEnv(p=0.25)
-          -> MaxAndSkipEnv(skip=4)
-          -> MontezumaInfoWrapper(room_address=3)        # for log/diagnostics only
-          -> WarpFrame(84x84 grayscale)
-          -> ClipRewardEnv(sign)
-          -> FrameStack(k=4)
-
-    We reproduce all of that synchronously on top of gymnasium/ale-py so
-    `info['episode']['visited_rooms']` is still available for room-count logs.
+    """envpool reproduces the original RND env stack (atari_wrappers.py:200-224)
+    natively: StickyActionEnv(p=0.25) -> MaxAndSkipEnv(skip=4) -> WarpFrame(84x84
+    grayscale, INTER_AREA) -> ClipRewardEnv(sign) -> FrameStack(k=4), with
+    visited_rooms recovered from info["ram"] inside the jitted rollout.
     """
     import time
-    from collections import deque
-    import gymnasium as gym
-    import cv2
+    import envpool
     import tyro
     import wandb
-    cv2.ocl.setUseOpenCL(False)
-    # --- env wrappers -------------------------------------------------------
-    class StickyActionEnv(gym.Wrapper):
-        # Repeat last action with prob p
-        def __init__(self, env, p: float = 0.25):
-            super().__init__(env)
-            self.p = p
-            self.last_action = 0
-        def reset(self, **kwargs):
-            self.last_action = 0
-            return self.env.reset(**kwargs)
-        def step(self, action):
-            if self.unwrapped.np_random.uniform() < self.p:
-                action = self.last_action
-            self.last_action = action
-            return self.env.step(action)
-    class MaxAndSkipEnv(gym.Wrapper):
-        """Sum reward over `skip` raw frames, return
-        max of last two."""
-        def __init__(self, env, skip: int = 4):
-            super().__init__(env)
-            self._obs_buffer = np.zeros((2,) + env.observation_space.shape, dtype=np.uint8)
-            self._skip = skip
-        def step(self, action):
-            total_reward = 0.0
-            terminated = truncated = False
-            info = {}
-            for i in range(self._skip):
-                obs, reward, terminated, truncated, info = self.env.step(action)
-                if i == self._skip - 2:
-                    self._obs_buffer[0] = obs
-                if i == self._skip - 1:
-                    self._obs_buffer[1] = obs
-                total_reward += reward
-                if terminated or truncated:
-                    break
-            return (self._obs_buffer.max(axis=0), total_reward, terminated, truncated, info)
-    class WarpFrame(gym.ObservationWrapper):
-        # RGB -> 84x84 gray uint8 (H, W, 1)
-        def __init__(self, env):
-            super().__init__(env)
-            self.width = 84
-            self.height = 84
-            self.observation_space = gym.spaces.Box(low=0, high=255, shape=(self.height, self.width, 1), dtype=np.uint8)
-        def observation(self, frame):
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-            frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
-            return frame[:, :, None]
-    class ClipRewardEnv(gym.RewardWrapper):
-        # Bin to {-1, 0, +1}
-        def reward(self, reward):
-            return float(np.sign(reward))
-    class FrameStack(gym.Wrapper):
-        # Stack k frames along channel axis
-        def __init__(self, env, k: int):
-            super().__init__(env)
-            self.k = k
-            self.frames = deque([], maxlen=k)
-            shp = env.observation_space.shape
-            self.observation_space = gym.spaces.Box(low=0, high=255, shape=(shp[0], shp[1], shp[2] * k), dtype=np.uint8)
-        def reset(self, **kwargs):
-            ob, info = self.env.reset(**kwargs)
-            for _ in range(self.k):
-                self.frames.append(ob)
-            return self._get_ob(), info
-        def step(self, action):
-            ob, reward, terminated, truncated, info = self.env.step(action)
-            self.frames.append(ob)
-            return self._get_ob(), reward, terminated, truncated, info
-        def _get_ob(self):
-            return np.concatenate(list(self.frames), axis=2)
-    class MontezumaInfoWrapper(gym.Wrapper):
-        # Tracks visited-rooms via RAM
-        def __init__(self, env, room_address: int):
-            super().__init__(env)
-            self.room_address = room_address
-            self.visited_rooms = set()
-        def _get_room(self):
-            ale = self.unwrapped.ale
-            return int(ale.getRAM()[self.room_address])
-        def reset(self, **kwargs):
-            self.visited_rooms.clear()
-            return self.env.reset(**kwargs)
-        def step(self, action):
-            obs, reward, terminated, truncated, info = self.env.step(action)
-            self.visited_rooms.add(self._get_room())
-            if terminated or truncated:
-                if "episode" not in info:
-                    info["episode"] = {}
-                info["episode"]["visited_rooms"] = list(self.visited_rooms)
-            return obs, reward, terminated, truncated, info
-    def make_atari(env_id, seed: int, max_episode_steps: int, sticky_p: float):
-        env = gym.make(env_id, render_mode=None)
-        if max_episode_steps:
-            env = gym.wrappers.TimeLimit(env.unwrapped, max_episode_steps=max_episode_steps * 4)
-        env.reset(seed=seed)
-        env = StickyActionEnv(env, p=sticky_p)
-        env = MaxAndSkipEnv(env, skip=4)
-        if "Montezuma" in env_id:
-            env = MontezumaInfoWrapper(env, room_address=3)
-        elif "Pitfall" in env_id:
-            env = MontezumaInfoWrapper(env, room_address=1)
-        env = WarpFrame(env)
-        env = ClipRewardEnv(env)
-        env = FrameStack(env, k=4)
-        return env
-    class VecAtari:
-        # Synchronous parallel atari env. Auto-resets on episode end
-        def __init__(self, env_id: str, num_envs: int, seed: int, max_episode_steps: int, sticky_p: float):
-            self.envs = [make_atari(env_id, seed + i, max_episode_steps, sticky_p) for i in range(num_envs)]
-            self.num_envs = num_envs
-            self.action_space = self.envs[0].action_space
-            self.observation_space = self.envs[0].observation_space
-            self.episode_returns = np.zeros(num_envs, dtype=np.float32)
-            self.episode_lengths = np.zeros(num_envs, dtype=np.int64)
-        def reset(self):
-            obs = []
-            for e in self.envs:
-                o, _ = e.reset()
-                obs.append(o)
-            return np.stack(obs, 0)
-        def step(self, actions):
-            obs, rew, done, infos = [], [], [], []
-            for i, (e, a) in enumerate(zip(self.envs, actions)):
-                o, r, term, trunc, info = e.step(int(a))
-                d = bool(term or trunc)
-                self.episode_returns[i] += r
-                self.episode_lengths[i] += 1
-                if d:
-                    info.setdefault("episode", {})
-                    info["episode"]["r"] = float(self.episode_returns[i])
-                    info["episode"]["l"] = int(self.episode_lengths[i])
-                    self.episode_returns[i] = 0.0
-                    self.episode_lengths[i] = 0
-                    o, _ = e.reset()
-                obs.append(o)
-                rew.append(r)
-                done.append(d)
-                infos.append(info)
-            return (np.stack(obs, 0), np.array(rew, dtype=np.float32), np.array(done, dtype=np.float32), infos)
-        def close(self):
-            for e in self.envs:
-                e.close()
-    # --- main ---------------------------------------------------------------
-    def main(cfg: Config):
-        wandb.init(project=cfg.wandb_project, config=vars(cfg))
-        venv = VecAtari(cfg.env, cfg.num_envs, cfg.seed, cfg.max_episode_steps, cfg.sticky_action_p)
-        num_actions = int(venv.action_space.n)
-        obs_shape = (84, 84, cfg.frame_stack)
-        steps_per_update = cfg.num_steps * cfg.num_envs
+    def _envpool_task_id(env_id):
+        # "MontezumaRevengeNoFrameskip-v4" / "ALE/MontezumaRevenge-v5" -> "MontezumaRevenge-v5"
+        name = env_id.split("/")[-1].split("NoFrameskip")[0].split("-")[0]
+        return f"{name}-v5"
+    def run_xla(cfg):
+        """Fully-jitted RND on envpool's XLA interface.
+
+        The rollout is a jax.lax.scan over envpool's XLA step (env-stepping is a
+        CPU custom call, policy forward on GPU, zero per-step Python / host
+        transfers). The learner (intrinsic reward, reward-forward-filter, dual
+        GAE, obs+rew norm, PPO update) is one jitted call. It's synchronous and
+        on-policy, so it stays paper-faithful (~11k SPS at num_envs=128).
+        visited_rooms is recovered from info["ram"] inside the scan.
+        """
+        N, STEPS = cfg.num_envs, cfg.num_steps
+        steps_per_update = STEPS * N
         total_updates = int(cfg.total_timesteps // steps_per_update)
+        room_addr = 3 if "Montezuma" in cfg.env else (1 if "Pitfall" in cfg.env else None)
+        env = envpool.make(
+            _envpool_task_id(cfg.env),
+            env_type="gymnasium",
+            num_envs=N,
+            seed=cfg.seed,
+            stack_num=cfg.frame_stack,
+            frame_skip=4,
+            gray_scale=True,
+            img_height=84,
+            img_width=84,
+            repeat_action_probability=cfg.sticky_action_p,
+            episodic_life=False,
+            reward_clip=True,
+            use_inter_area_resize=True,
+            max_episode_steps=cfg.max_episode_steps,
+            num_threads=cfg.envpool_num_threads,
+        )
+        num_actions = int(env.action_space.n)
+        handle, recv, send, step_env = env.xla()
         rng = jax.random.PRNGKey(cfg.seed)
-        agent, rng = create_learner(cfg, rng, obs_shape, num_actions, num_total_updates=total_updates)
-        # collect_random_statistics: initialize obs_rms by stepping a uniform-
-        # random policy for 128*50 steps in batches of `128 * num_envs`
-        if cfg.update_ob_stats_from_random_agent:
-            obs = venv.reset()
-            chunk = []
-            target = 128 * cfg.num_iterations_obs_norm_init
-            print(f"Collecting obs-norm warmup: {target} steps " f"({cfg.num_iterations_obs_norm_init} chunks of 128).")
-            for step in range(target):
-                acs = np.random.randint(low=0, high=num_actions, size=(cfg.num_envs,))
-                obs, _, _, _ = venv.step(acs)
-                chunk.append(obs)
-                if (step + 1) % 128 == 0:
-                    batch = np.stack(chunk, axis=1)  # (num_envs, 128, 84, 84, 4)
-                    batch = batch.reshape((-1,) + batch.shape[2:])
-                    agent = agent.update_obs_norm(jnp.asarray(batch))
-                    chunk.clear()
-        last_obs = venv.reset()
-        update_idx = 0
-        t_start = time.time()
-        ep_returns = deque(maxlen=100)
-        ep_lengths = deque(maxlen=100)
-        rooms_seen = set()
-        # Rollout buffer (numpy host-side, fed into JIT'd update each step)
-        H, W, C = obs_shape
-        buf_obs = np.zeros((cfg.num_envs, cfg.num_steps, H, W, C), np.uint8)
-        buf_acs = np.zeros((cfg.num_envs, cfg.num_steps), np.int64)
-        buf_rews_ext = np.zeros((cfg.num_envs, cfg.num_steps), np.float32)
-        buf_rews_int = np.zeros((cfg.num_envs, cfg.num_steps), np.float32)
-        buf_dones = np.zeros((cfg.num_envs, cfg.num_steps), np.float32)
-        buf_vpreds_ext = np.zeros((cfg.num_envs, cfg.num_steps), np.float32)
-        buf_vpreds_int = np.zeros((cfg.num_envs, cfg.num_steps), np.float32)
-        buf_nlps = np.zeros((cfg.num_envs, cfg.num_steps), np.float32)
-        last_done = np.zeros(cfg.num_envs, np.float32)
-        while update_idx < total_updates:
-            for t in range(cfg.num_steps):
-                acs, log_probs, ves, vis, rng = agent.act(jnp.asarray(last_obs), rng)
-                acs_np = np.asarray(acs)
-                buf_obs[:, t] = last_obs
-                buf_acs[:, t] = acs_np
-                buf_dones[:, t] = last_done
-                buf_vpreds_ext[:, t] = np.asarray(ves)
-                buf_vpreds_int[:, t] = np.asarray(vis)
-                buf_nlps[:, t] = -np.asarray(log_probs)
-                last_obs, rew, done, infos = venv.step(acs_np)
-                buf_rews_ext[:, t] = rew
-                last_done = done
-                for info in infos:
-                    if "episode" in info and "r" in info["episode"]:
-                        ep_returns.append(info["episode"]["r"])
-                        ep_lengths.append(info["episode"]["l"])
-                    if "episode" in info and "visited_rooms" in info["episode"]:
-                        rooms_seen.update(info["episode"]["visited_rooms"])
-            # Compute intrinsic rewards over the full rollout — uses the
-            # pre-rollout obs_norm (paper default)
-            obs_for_int = jnp.asarray(buf_obs.reshape((-1,) + buf_obs.shape[2:]))
-            int_rews = agent.intrinsic_reward(obs_for_int)
-            buf_rews_int[:] = np.asarray(int_rews).reshape(cfg.num_envs, cfg.num_steps)
-            # update obs_rms from this rollout's obs
-            agent = agent.update_obs_norm(jnp.asarray(buf_obs))
-            # RewardForwardFilter -> running var of returns
-            rewems = np.asarray(agent.rew_norm.rewems)
-            rffs = np.zeros_like(buf_rews_int)
-            for t in range(cfg.num_steps):
-                rewems = rewems * cfg.gamma_int + buf_rews_int[:, t]
-                rffs[:, t] = rewems
-            agent = agent.update_rew_norm(jnp.asarray(rffs), jnp.asarray(rewems))
-            int_var = float(np.asarray(agent.rew_norm.var))
-            norm_int_rewards = buf_rews_int / np.sqrt(int_var + 1e-8)
-            # Last value for bootstrap (last-step path)
-            last_val_ext, last_val_int = agent.value(jnp.asarray(last_obs))
-            last_val_ext = np.asarray(last_val_ext)
-            last_val_int = np.asarray(last_val_int)
-            # Dual GAE
-            advs_ext = np.zeros_like(buf_rews_ext)
-            advs_int = np.zeros_like(buf_rews_int)
-            lastgaelam_ext = np.zeros(cfg.num_envs, dtype=np.float32)
-            lastgaelam_int = np.zeros(cfg.num_envs, dtype=np.float32)
-            for t in reversed(range(cfg.num_steps)):
-                if t == cfg.num_steps - 1:
-                    next_vals_ext = last_val_ext
-                    next_vals_int = last_val_int
-                    next_done = last_done
-                else:
-                    next_vals_ext = buf_vpreds_ext[:, t + 1]
-                    next_vals_int = buf_vpreds_int[:, t + 1]
-                    next_done = buf_dones[:, t + 1]
-                # Extrinsic GAE WITH done mask
-                notdone = 1.0 - next_done
-                delta_ext = buf_rews_ext[:, t] + cfg.gamma_ext * next_vals_ext * notdone - buf_vpreds_ext[:, t]
-                advs_ext[:, t] = lastgaelam_ext = delta_ext + cfg.gamma_ext * cfg.gae_lambda * notdone * lastgaelam_ext
-                # Intrinsic GAE — use_news=0 means NO done mask
-                if cfg.use_news:
-                    nextnotnew_int = notdone
-                else:
-                    nextnotnew_int = np.ones_like(notdone)
-                delta_int = norm_int_rewards[:, t] + cfg.gamma_int * next_vals_int * nextnotnew_int - buf_vpreds_int[:, t]
-                advs_int[:, t] = lastgaelam_int = delta_int + cfg.gamma_int * cfg.gae_lambda * nextnotnew_int * lastgaelam_int
-            targets_ext = advs_ext + buf_vpreds_ext
-            targets_int = advs_int + buf_vpreds_int
-            advs = cfg.ext_coef * advs_ext + cfg.int_coef * advs_int
-            traj = Transition(
-                done=jnp.asarray(buf_dones),
-                action=jnp.asarray(buf_acs),
-                value_ext=jnp.asarray(buf_vpreds_ext),
-                value_int=jnp.asarray(buf_vpreds_int),
-                reward=jnp.asarray(buf_rews_ext),
-                int_reward=jnp.asarray(buf_rews_int),
-                log_prob=-jnp.asarray(buf_nlps),
-                obs=jnp.asarray(buf_obs),
+        agent, rng = create_learner(cfg, rng, (84, 84, cfg.frame_stack), num_actions, num_total_updates=total_updates)
+        wandb.init(project=cfg.wandb_project, config=vars(cfg))
+        GE, GI, LAM, USE_NEWS = cfg.gamma_ext, cfg.gamma_int, cfg.gae_lambda, cfg.use_news
+        apply_pol = agent.train_state.apply_fn
+        def nhwc(o):
+            return jnp.transpose(o, (0, 2, 3, 1))  # (N,4,84,84)->(N,84,84,4), free view on-device
+        # ---- rollout: one jitted scan over STEPS envpool XLA steps ----
+        def rollout(agent, handle, obs, rng, ep_ret, ep_len, rooms):
+            params = agent.train_state.params["policy"]
+            def body(carry, _):
+                handle, obs, rng, ep_ret, ep_len, sret, slen, cnt, rooms = carry
+                logits, ve, vi = apply_pol(params, obs)
+                pi = distrax.Categorical(logits=logits)
+                rng, sk = jax.random.split(rng)
+                action = pi.sample(seed=sk)
+                logp = pi.log_prob(action)
+                handle, (nobs, reward, term, trunc, info) = step_env(handle, action.astype(jnp.int32))
+                done = jnp.logical_or(term, trunc)
+                # episode return uses the RAW (unclipped) reward from info -- the
+                # true game score cleanRL/the paper plot. Training still uses the
+                # clipped `reward`. episodic_life=False so done == true game-over.
+                ep_ret = ep_ret + info["reward"]
+                ep_len = ep_len + 1
+                sret = sret + jnp.sum(jnp.where(done, ep_ret, 0.0))
+                slen = slen + jnp.sum(jnp.where(done, ep_len, 0))
+                cnt = cnt + jnp.sum(done.astype(jnp.int32))
+                ep_ret = jnp.where(done, 0.0, ep_ret)
+                ep_len = jnp.where(done, 0, ep_len)
+                if room_addr is not None:
+                    rooms = rooms.at[info["ram"][:, room_addr].astype(jnp.int32)].set(True)
+                out = (obs, action, logp, ve, vi, reward, done.astype(jnp.float32))
+                return (handle, nhwc(nobs), rng, ep_ret, ep_len, sret, slen, cnt, rooms), out
+            z = (jnp.float32(0.0), jnp.int32(0), jnp.int32(0))
+            init = (handle, obs, rng, ep_ret, ep_len, *z, rooms)
+            (handle, obs, rng, ep_ret, ep_len, sret, slen, cnt, rooms), outs = jax.lax.scan(body, init, None, length=STEPS)
+            obs_b, act_b, logp_b, ve_b, vi_b, rew_b, done_b = outs
+            traj = Transition(done=done_b, action=act_b, value_ext=ve_b, value_int=vi_b, reward=rew_b, int_reward=rew_b, log_prob=logp_b, obs=obs_b)
+            stats = dict(sret=sret, slen=slen, cnt=cnt)
+            return handle, obs, rng, ep_ret, ep_len, rooms, traj, stats
+        rollout_jit = jax.jit(rollout)
+        # ---- on-device dual GAE (reverse scan over STEPS, arrays are (STEPS,N)) ----
+        def dual_gae(rew_ext, norm_int, ve, vi, done, last_ve, last_vi):
+            next_ve = jnp.concatenate([ve[1:], last_ve[None]], 0)
+            next_vi = jnp.concatenate([vi[1:], last_vi[None]], 0)
+            next_done = done  # done[t] == "obs_{t+1} is a boundary" == host buf_dones[t+1]
+            def body(carry, x):
+                gae_e, gae_i = carry
+                re, ni, v_e, v_i, nv_e, nv_i, nd = x
+                notdone = 1.0 - nd
+                delta_e = re + GE * nv_e * notdone - v_e
+                gae_e = delta_e + GE * LAM * notdone * gae_e
+                nn_i = notdone if USE_NEWS else 1.0
+                delta_i = ni + GI * nv_i * nn_i - v_i
+                gae_i = delta_i + GI * LAM * nn_i * gae_i
+                return (gae_e, gae_i), (gae_e, gae_i)
+            _, (adv_e, adv_i) = jax.lax.scan(
+                body, (jnp.zeros(N), jnp.zeros(N)), (rew_ext, norm_int, ve, vi, next_ve, next_vi, next_done), reverse=True
             )
-            agent, info, rng = agent.update(traj, jnp.asarray(advs), jnp.asarray(targets_ext), jnp.asarray(targets_int), rng)
-            update_idx += 1
+            return adv_e, adv_i
+        # ---- learner: intrinsic + rew-filter + norms + GAE + PPO update, one jit ----
+        def learn(agent, traj, last_obs, rng):
+            obs = traj.obs
+            flat = obs.reshape((STEPS * N,) + obs.shape[2:])
+            int_rews = agent.intrinsic_reward(flat).reshape(STEPS, N)  # uses pre-update obs_norm
+            def rff(carry, r):
+                rewems = carry * GI + r
+                return rewems, rewems
+            rewems_final, rffs = jax.lax.scan(rff, agent.rew_norm.rewems, int_rews)
+            r_mean, r_var, r_cnt = welford_update(agent.rew_norm, rffs.reshape(-1))
+            agent = agent.replace(rew_norm=RewNormState(rewems=rewems_final, mean=r_mean, var=r_var, count=r_cnt))
+            norm_int = int_rews / jnp.sqrt(r_var + 1e-8)
+            agent = agent.update_obs_norm(flat)  # post-intrinsic, like main()
+            last_ve, last_vi = agent.value(last_obs)
+            adv_e, adv_i = dual_gae(traj.reward, norm_int, traj.value_ext, traj.value_int, traj.done, last_ve, last_vi)
+            tgt_e, tgt_i = adv_e + traj.value_ext, adv_i + traj.value_int
+            adv = cfg.ext_coef * adv_e + cfg.int_coef * adv_i
+            tr = traj._replace(int_reward=int_rews)
+            agent, info, rng = agent.update(tr, adv, tgt_e, tgt_i, rng)
+            info = dict(info)
+            info.update(
+                rewintmean_unnorm=int_rews.mean(),
+                rewintmax_unnorm=int_rews.max(),
+                rewintmean_norm=norm_int.mean(),
+                vpredintmean=traj.value_int.mean(),
+                vpredextmean=traj.value_ext.mean(),
+                advmean=adv.mean(),
+            )
+            return agent, info, rng
+        learn_jit = jax.jit(learn)
+        o, _ = env.reset()
+        obs = nhwc(jnp.asarray(o))
+        ep_ret = jnp.zeros(N, jnp.float32)
+        ep_len = jnp.zeros(N, jnp.int32)
+        rooms = jnp.zeros(256, bool)
+        # obs-norm warmup: uniform-random actions for 128*num_iterations steps
+        @jax.jit
+        def rand_rollout(handle, obs, rng):
+            def body(carry, _):
+                handle, obs, rng = carry
+                rng, sk = jax.random.split(rng)
+                a = jax.random.randint(sk, (N,), 0, num_actions).astype(jnp.int32)
+                handle, (nobs, r, te, tr, info) = step_env(handle, a)
+                return (handle, nhwc(nobs), rng), obs
+            (handle, obs, rng), obs_b = jax.lax.scan(body, (handle, obs, rng), None, length=STEPS)
+            return handle, obs, rng, obs_b
+        if cfg.update_ob_stats_from_random_agent:
+            print(f"Collecting obs-norm warmup: {STEPS * cfg.num_iterations_obs_norm_init} steps.")
+            for _ in range(cfg.num_iterations_obs_norm_init):
+                handle, obs, rng, obs_b = rand_rollout(handle, obs, rng)
+                agent = agent.update_obs_norm(obs_b.reshape((STEPS * N,) + obs_b.shape[2:]))
+        t_start = time.time()
+        t_last = t_start
+        win_sret = win_slen = win_cnt = 0.0
+        rooms_seen = set()
+        info = None
+        for update_idx in range(1, total_updates + 1):
+            handle, obs, rng, ep_ret, ep_len, rooms, traj, stats = rollout_jit(agent, handle, obs, rng, ep_ret, ep_len, rooms)
+            rng, learn_rng = jax.random.split(rng)
+            agent, info, rng = learn_jit(agent, traj, obs, learn_rng)
+            win_sret += float(stats["sret"])
+            win_slen += float(stats["slen"])
+            win_cnt += float(stats["cnt"])
             if update_idx % cfg.log_every_n_updates == 0:
+                if room_addr is not None:
+                    rooms_seen = set(np.nonzero(np.asarray(rooms))[0].tolist())
                 tcount = update_idx * steps_per_update
-                tps = tcount / max(time.time() - t_start, 1e-6)
+                now = time.time()
                 log = {
                     "tcount": tcount,
-                    "tps": tps,
+                    "tps": tcount / max(now - t_start, 1e-6),
+                    "sps": (cfg.log_every_n_updates * steps_per_update) / max(now - t_last, 1e-6),
                     "n_rooms": len(rooms_seen),
                     "rooms": sorted(rooms_seen),
-                    "eprew_mean": float(np.mean(ep_returns)) if ep_returns else 0.0,
-                    "eplen_mean": float(np.mean(ep_lengths)) if ep_lengths else 0.0,
-                    "rewintmean_unnorm": float(buf_rews_int.mean()),
-                    "rewintmax_unnorm": float(buf_rews_int.max()),
-                    "rewintmean_norm": float(norm_int_rewards.mean()),
-                    "vpredintmean": float(buf_vpreds_int.mean()),
-                    "vpredextmean": float(buf_vpreds_ext.mean()),
-                    "advmean": float(advs.mean()),
+                    "eprew_mean": win_sret / win_cnt if win_cnt else 0.0,
+                    "eplen_mean": win_slen / win_cnt if win_cnt else 0.0,
                     **{k: float(v) for k, v in info.items()},
                 }
+                t_last = now
+                win_sret = win_slen = win_cnt = 0.0
                 print(f"[{update_idx}/{total_updates}] {log}")
                 wandb.log(log, step=tcount)
-        venv.close()
         wandb.finish()
-    main(tyro.cli(Config))
+    run_xla(tyro.cli(Config))
