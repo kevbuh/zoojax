@@ -1,4 +1,4 @@
-ZOOJAX
+![ZOOJAX](zoojax.png)
 
 single-file implementations of RL algorithms so i can actually do research
 
