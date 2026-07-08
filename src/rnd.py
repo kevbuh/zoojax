@@ -1,9 +1,28 @@
 # Paper:          https://arxiv.org/abs/1810.12894
 # Reference impl: https://github.com/openai/random-network-distillation
+# Wanb:           https://wandb.ai/kevinbuhler/rnd-ppo-brax/runs/nzwknnrw
+
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "jax[cuda13]",
+#     "flax",
+#     "optax",
+#     "distrax",
+#     "numpy",
+#     "chex",
+#     "matplotlib",
+#     "wandb",
+#     "tyro",
+#     "gymnax",
+#     "brax",
+#     "navix",
+# ]
+# ///
 
 import os
 
-os.environ.setdefault("MUJOCO_GL", "osmesa")
+os.environ.setdefault("MUJOCO_GL", "egl")
 
 from dataclasses import dataclass  # noqa: E402
 from typing import Any, NamedTuple, Sequence  # noqa: E402
@@ -48,7 +67,7 @@ class Config:
     # Train
     seed: int = 0
     num_seeds: int = 1
-    env: str = "hopper"
+    env: str = "ant"
     total_timesteps: int = 50_000_000
     # Eval
     eval_every: int = 500_000

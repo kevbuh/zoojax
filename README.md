@@ -16,7 +16,7 @@ single-file implementations of RL algorithms so i can actually do research
 | Predictron | [src/torch_predictron.py](src/torch_predictron.py) | |
 | Recurrent Visual Attention | [src/torch_recurrent_visual_attention.py](src/torch_recurrent_visual_attention.py) | |
 | REINFORCE | [src/torch_reinforce.py](src/torch_reinforce.py) | |
-| RND | [src/rnd.py](src/rnd.py), [src/rnd_atari.py](src/rnd_atari.py) | [Atari](https://wandb.ai/kevinbuhler/rnd-atari-jax/reports/ZOOJAX-Atari-RND--VmlldzoxNzQzOTYzOA) |
+| RND | [src/rnd.py](src/rnd.py), [src/rnd_atari.py](src/rnd_atari.py) | [Brax](https://wandb.ai/kevinbuhler/rnd-ppo-brax/runs/nzwknnrw), [Atari](https://wandb.ai/kevinbuhler/rnd-atari-jax/reports/ZOOJAX-Atari-RND--VmlldzoxNzQzOTYzOA) |
 | SMiRL | [src/smirl.py](src/smirl.py) | |
 | SMM | [src/smm.py](src/smm.py) | |
 | Squeeze-Excitation | [src/squeeze_excitation.py](src/squeeze_excitation.py) | |
