@@ -1,8 +1,28 @@
-# based on https://github.com/luchris429/purejaxrl/blob/main/purejaxrl/ppo_continuous_action.py
+# Paper:    https://arxiv.org/abs/1707.06347
+# based on: https://github.com/luchris429/purejaxrl/blob/main/purejaxrl/ppo_continuous_action.py
+# Wandb:    https://wandb.ai/kevinbuhler/zoojax/runs/14neyqzq
+
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "jax[cuda13]",
+#     "flax",
+#     "optax",
+#     "distrax",
+#     "numpy",
+#     "chex",
+#     "matplotlib",
+#     "wandb",
+#     "tyro",
+#     "gymnax",
+#     "brax",
+#     "navix",
+# ]
+# ///
 
 import os
 
-os.environ.setdefault("MUJOCO_GL", "osmesa")
+os.environ.setdefault("MUJOCO_GL", "egl")
 
 from dataclasses import dataclass  # noqa: E402
 from functools import partial  # noqa: E402
@@ -153,7 +173,7 @@ class Config:
     # train
     seed: int = 0
     env: str = "ant"
-    wandb_project: str = "rnd-jax-debug"
+    wandb_project: str = "zoojax"
     total_timesteps: int = 50_000_000
     # eval
     eval_every: int = 500_000

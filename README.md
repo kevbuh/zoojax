@@ -8,7 +8,7 @@ single-file implementations of RL algorithms so i can actually do research
 | APS | [src/aps.py](src/aps.py), [src/aps_minidoom.py](src/aps_minidoom.py) | |
 | CRL | [src/crl.py](src/crl.py), [src/scaling_crl.py](src/scaling_crl.py) | |
 | DQN | [src/torch_cleanrl_dqn_atari.py](src/torch_cleanrl_dqn_atari.py) | |
-| PPO | [src/ppo.py](src/ppo.py), [src/torch_cleanrl_ppo_atari.py](src/torch_cleanrl_ppo_atari.py) | |
+| PPO | [src/ppo.py](src/ppo.py), [src/torch_cleanrl_ppo_atari.py](src/torch_cleanrl_ppo_atari.py) | [Brax](https://wandb.ai/kevinbuhler/zoojax/runs/14neyqzq) |
 | Rainbow | [src/torch_cleanrl_rainbow_atari.py](src/torch_cleanrl_rainbow_atari.py) | |
 | DIAYN | [src/diayn.py](src/diayn.py) | |
 | E3B | [src/e3b.py](src/e3b.py), [src/e3b_minidoom.py](src/e3b_minidoom.py) | |
